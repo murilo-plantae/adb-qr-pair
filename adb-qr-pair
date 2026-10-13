@@ -1,0 +1,117 @@
+#!/usr/bin/env bash
+# Pareia/conecta um device por Wireless Debugging sem abrir o Android Studio.
+set -uo pipefail
+
+MODE=auto
+INVERT=0
+TIMEOUT=120
+
+usage() {
+    cat <<'USAGE'
+adb-qr-pair [opções]
+
+  (sem opção)   tenta reconectar via mDNS; só mostra o QR se o device não estiver pareado
+  --pair, -p    força o fluxo do QR code (device novo ou pareamento revogado)
+  --connect, -c só reconecta, nunca mostra QR
+  --invert, -i  inverte as cores do QR (se a câmera não ler no seu tema de terminal)
+  --timeout N   segundos esperando o device aparecer no mDNS (default 120)
+
+No celular: Opções do desenvolvedor > Depuração sem fio.
+  reconectar -> basta ativar a chave
+  parear     -> "Parear dispositivo com código QR"
+USAGE
+}
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -p|--pair) MODE=pair ;;
+        -c|--connect) MODE=connect ;;
+        -i|--invert) INVERT=1 ;;
+        --timeout) TIMEOUT="$2"; shift ;;
+        -h|--help) usage; exit 0 ;;
+        *) echo "opção desconhecida: $1" >&2; usage >&2; exit 2 ;;
+    esac
+    shift
+done
+
+command -v adb >/dev/null || { echo "adb não está no PATH" >&2; exit 1; }
+
+# O mDNS do adb só popula depois que o server está de pé há alguns segundos.
+adb start-server >/dev/null 2>&1
+
+mdns_find() {
+    # $1 = sufixo do tipo de serviço (pairing|connect), $2 = nome exato ou vazio
+    adb mdns services 2>/dev/null | awk -v want="$1" -v name="${2:-}" '
+        $2 ~ want && (name == "" || $1 == name) { print $3; exit }
+    '
+}
+
+wait_for_service() {
+    local kind="$1" name="${2:-}" limit="${3:-$TIMEOUT}" addr
+    local deadline=$((SECONDS + limit))
+    while [ $SECONDS -lt $deadline ]; do
+        addr="$(mdns_find "$kind" "$name")"
+        [ -n "$addr" ] && { echo "$addr"; return 0; }
+        sleep 1
+    done
+    return 1
+}
+
+try_connect() {
+    local quiet="${1:-}" addr out
+    addr="$(mdns_find '_adb-tls-connect' '')"
+    [ -z "$addr" ] && { sleep 3; addr="$(mdns_find '_adb-tls-connect' '')"; }
+    if [ -z "$addr" ]; then
+        [ "$quiet" != quiet ] && echo "Nenhum device anunciando depuração sem fio na rede." >&2
+        return 1
+    fi
+    out="$(adb connect "$addr" 2>&1)"
+    if printf '%s' "$out" | grep -qi 'connected to'; then
+        echo "✓ conectado: $addr"
+        return 0
+    fi
+    [ "$quiet" != quiet ] && echo "falhou em $addr: $out" >&2
+    return 1
+}
+
+do_pair() {
+    local name pass addr out qrflag=ANSIUTF8
+    name="studio-$(tr -dc 'a-f0-9' </dev/urandom | head -c 8)"
+    pass="$(tr -dc 'A-Za-z0-9' </dev/urandom | head -c 12)"
+    [ "$INVERT" = 1 ] && qrflag=ANSIUTF8i
+
+    echo
+    qrencode -t "$qrflag" -m 2 "WIFI:T:ADB;S:${name};P:${pass};;"
+    echo "No celular: Depuração sem fio > Parear dispositivo com código QR"
+    echo "Aguardando (até ${TIMEOUT}s)... Ctrl-C para abortar."
+
+    addr="$(wait_for_service '_adb-tls-pairing' "$name")" || {
+        echo "✗ o device não apareceu no mDNS. Confira se os dois estão no mesmo Wi-Fi." >&2
+        return 1
+    }
+
+    out="$(adb pair "$addr" "$pass" 2>&1)"
+    if ! printf '%s' "$out" | grep -qi 'successfully paired'; then
+        echo "✗ pareamento falhou: $out" >&2
+        return 1
+    fi
+    echo "✓ pareado com $addr"
+
+    # O device só anuncia _adb-tls-connect depois do pareamento concluir.
+    local caddr
+    caddr="$(wait_for_service '_adb-tls-connect' '' 20)" || caddr=""
+    if [ -n "$caddr" ]; then
+        adb connect "$caddr" >/dev/null 2>&1 && echo "✓ conectado: $caddr"
+    fi
+}
+
+case "$MODE" in
+    connect) try_connect ;;
+    pair)    do_pair ;;
+    auto)    try_connect quiet || { echo "Não deu pra reconectar — caindo pro QR."; do_pair; } ;;
+esac
+
+status=$?
+echo
+adb devices -l | sed '/^$/d'
+exit $status
