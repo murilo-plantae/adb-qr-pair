@@ -59,6 +59,10 @@ wait_for_service() {
 
 try_connect() {
     local quiet="${1:-}" addr out
+    if adb devices | awk 'NR>1 && $2=="device"' | grep -q .; then
+        echo "✓ já há device conectado"
+        return 0
+    fi
     addr="$(mdns_find '_adb-tls-connect' '')"
     [ -z "$addr" ] && { sleep 3; addr="$(mdns_find '_adb-tls-connect' '')"; }
     if [ -z "$addr" ]; then
@@ -70,7 +74,16 @@ try_connect() {
         echo "✓ conectado: $addr"
         return 0
     fi
-    [ "$quiet" != quiet ] && echo "falhou em $addr: $out" >&2
+    # Anúncio fantasma: o responder mDNS do Android continua servindo a porta de
+    # uma sessão antiga depois que o adbd morre, então o registro existe e o TCP recusa.
+    if printf '%s' "$out" | grep -qi 'refused'; then
+        [ "$quiet" != quiet ] && cat >&2 <<MSG
+O device anuncia $addr, mas nada escuta nessa porta (anúncio mDNS velho).
+Desligue e religue "Depuração sem fio" no celular — isso registra a porta nova.
+MSG
+    else
+        [ "$quiet" != quiet ] && echo "falhou em $addr: $out" >&2
+    fi
     return 1
 }
 

@@ -1,0 +1,162 @@
+#!/usr/bin/env bash
+# Captura a tela ativa do Android e traz o PNG pra cá.
+set -uo pipefail
+
+DEST_DIR="${ADB_SHOT_DIR:-$HOME/Pictures/adb-shots}"
+OUT=""
+SCALE=""
+COPY=1
+OPEN=0
+WATCH=0
+SERIAL=()
+
+usage() {
+    cat <<'USAGE'
+adb-shot [opções]
+
+  (sem opção)      captura a tela ativa agora e salva em ~/Pictures/adb-shots/
+  -o, --out FILE   salva nesse caminho em vez do diretório padrão
+  -s, --scale N    redimensiona para N% (ex.: -s 40) — útil pra colar em chat/issue
+  -w, --watch      espelha: toda print tirada NO celular é puxada automaticamente
+  -O, --open       abre a imagem no visualizador padrão
+      --no-copy    não copia pro clipboard
+      --serial ID  escolhe o device (quando há mais de um conectado)
+  -h, --help
+
+O caminho da última captura fica sempre em ~/Pictures/adb-shots/last.png
+USAGE
+}
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -o|--out) OUT="$2"; shift ;;
+        -s|--scale) SCALE="$2"; shift ;;
+        -w|--watch) WATCH=1 ;;
+        -O|--open) OPEN=1 ;;
+        --no-copy) COPY=0 ;;
+        --serial) SERIAL=(-s "$2"); shift ;;
+        -h|--help) usage; exit 0 ;;
+        *) echo "opção desconhecida: $1" >&2; usage >&2; exit 2 ;;
+    esac
+    shift
+done
+
+command -v adb >/dev/null || { echo "adb não está no PATH" >&2; exit 1; }
+
+ADB=(adb "${SERIAL[@]+"${SERIAL[@]}"}")
+
+check_device() {
+    local list uniq n raw tid
+    # O nome do transport mDNS contém espaço ("nome (2)._adb-tls-connect._tcp"),
+    # então não dá pra achar o estado por posição de campo — case no " device ".
+    list="$("${ADB[@]}" devices -l | awk 'NR>1 && /[ \t]device[ \t]/')"
+    raw="$(printf '%s\n' "$list" | grep -c .)"
+    # O auto-connect mDNS registra o mesmo aparelho duas vezes (a segunda com
+    # sufixo " (2)"). São transports distintas: o adb recusa comandos com
+    # "more than one device" até fixar uma com -t.
+    uniq="$(printf '%s\n' "$list" | sed -e 's/[ \t]device[ \t].*//' -e 's/ ([0-9]*)\./\./' | sort -u | grep -c .)"
+    n="$uniq"
+
+    if [ "$raw" -eq 0 ]; then
+        echo "Nenhum device conectado. Use 'adb-qr-pair' pra conectar sem fio." >&2
+        return 1
+    fi
+    if [ "$n" -gt 1 ] && [ ${#SERIAL[@]} -eq 0 ]; then
+        echo "Mais de um device conectado — escolha com --serial:" >&2
+        printf '%s\n' "$list" >&2
+        return 1
+    fi
+    if [ "$raw" -gt 1 ] && [ ${#SERIAL[@]} -eq 0 ]; then
+        tid="$(printf '%s\n' "$list" | sed -n 's/.*transport_id:\([0-9]*\).*/\1/p' | head -1)"
+        [ -n "$tid" ] && ADB=(adb -t "$tid")
+    fi
+}
+
+is_png() { [ -s "$1" ] && [ "$(head -c4 "$1" | od -An -tx1 | tr -d ' \n')" = "89504e47" ]; }
+
+postprocess() {
+    local f="$1"
+    if [ -n "$SCALE" ]; then
+        python3 - "$f" "$SCALE" <<'PY' || echo "aviso: resize falhou, mantendo original" >&2
+import sys
+from PIL import Image
+path, pct = sys.argv[1], float(sys.argv[2]) / 100
+img = Image.open(path)
+img.resize((max(1, int(img.width * pct)), max(1, int(img.height * pct))), Image.LANCZOS).save(path, format="PNG")
+PY
+    fi
+
+    mkdir -p "$DEST_DIR"
+    ln -sfn "$(realpath "$f")" "$DEST_DIR/last.png"
+
+    if [ "$COPY" = 1 ]; then
+        if [ -n "${WAYLAND_DISPLAY:-}" ] && command -v wl-copy >/dev/null; then
+            wl-copy --type image/png < "$f" 2>/dev/null &
+        elif command -v xclip >/dev/null; then
+            xclip -selection clipboard -t image/png -i "$f" 2>/dev/null &
+        fi
+    fi
+
+    [ "$OPEN" = 1 ] && command -v xdg-open >/dev/null && xdg-open "$f" >/dev/null 2>&1 &
+
+    local dims=""
+    dims="$(python3 -c 'import sys;from PIL import Image;i=Image.open(sys.argv[1]);print(f"{i.width}x{i.height}")' "$f" 2>/dev/null)"
+    echo "$f${dims:+  ($dims)}"
+}
+
+capture() {
+    local f="${1:-}"
+    if [ -z "$f" ]; then
+        mkdir -p "$DEST_DIR"
+        f="$DEST_DIR/$(date +%Y-%m-%d_%H-%M-%S).png"
+    fi
+    mkdir -p "$(dirname "$f")"
+
+    "${ADB[@]}" exec-out screencap -p > "$f" 2>/dev/null
+
+    # Algumas ROMs devolvem lixo no exec-out; o caminho via arquivo sempre funciona.
+    if ! is_png "$f"; then
+        local tmp=/sdcard/.adb-shot.png
+        "${ADB[@]}" shell screencap -p "$tmp" >/dev/null 2>&1 \
+            && "${ADB[@]}" pull "$tmp" "$f" >/dev/null 2>&1
+        "${ADB[@]}" shell rm -f "$tmp" >/dev/null 2>&1
+    fi
+
+    if ! is_png "$f"; then
+        rm -f "$f"
+        echo "✗ não consegui capturar a tela." >&2
+        return 1
+    fi
+    postprocess "$f"
+}
+
+remote_shots() {
+    "${ADB[@]}" shell 'ls -1 /sdcard/DCIM/Screenshots /sdcard/Pictures/Screenshots 2>/dev/null' \
+        | tr -d '\r' | grep -iE '\.(png|jpg|jpeg)$'
+}
+
+watch_loop() {
+    local seen new base dest
+    echo "Espelhando prints do celular. Tire um print no aparelho — Ctrl-C pra sair."
+    seen="$(remote_shots)"
+    while sleep 2; do
+        new="$(remote_shots)"
+        while IFS= read -r base; do
+            [ -z "$base" ] && continue
+            grep -qxF "$base" <<<"$seen" && continue
+            mkdir -p "$DEST_DIR"
+            dest="$DEST_DIR/$base"
+            for dir in /sdcard/DCIM/Screenshots /sdcard/Pictures/Screenshots; do
+                "${ADB[@]}" pull "$dir/$base" "$dest" >/dev/null 2>&1 && break
+            done
+            if [ -s "$dest" ]; then
+                postprocess "$dest"
+                command -v notify-send >/dev/null && notify-send -i "$dest" "adb-shot" "$base" 2>/dev/null
+            fi
+        done <<<"$new"
+        seen="$new"
+    done
+}
+
+check_device || exit 1
+if [ "$WATCH" = 1 ]; then watch_loop; else capture "$OUT"; fi
